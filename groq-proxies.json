@@ -1,0 +1,27 @@
+{
+  "proxies": [
+    {
+      "host": "proxy1.example.com",
+      "port": 8080,
+      "auth": {
+        "username": "user1",
+        "password": "password1"
+      },
+      "apiKey": "groq_api_key_1_from_config"
+    },
+    {
+      "host": "proxy2.example.com",
+      "port": 8081,
+      "apiKey": "groq_api_key_2_from_config"
+    },
+    {
+      "host": "proxy3.example.com",
+      "port": 8082,
+      "auth": {
+        "username": "user3",
+        "password": "password3"
+      },
+      "apiKey": "groq_api_key_3_from_config"
+    }
+  ]
+}

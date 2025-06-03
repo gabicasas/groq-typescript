@@ -150,6 +150,7 @@ export class Groq extends Core.APIClient {
       httpAgent: options.httpAgent,
       maxRetries: options.maxRetries,
       fetch: options.fetch,
+      apiKey: options.apiKey, // Pass apiKey to APIClient constructor
     });
 
     this._options = options;
@@ -177,6 +178,9 @@ export class Groq extends Core.APIClient {
   }
 
   protected override authHeaders(opts: Core.FinalRequestOptions): Core.Headers {
+    // This provides the "default" auth header if no proxy is used,
+    // or if a proxy is used but doesn't have its own apiKey.
+    // It will be correctly overridden by the proxy-specific apiKey in APIClient.buildHeaders.
     return { Authorization: `Bearer ${this.apiKey}` };
   }
 

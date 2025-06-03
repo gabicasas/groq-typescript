@@ -1,4 +1,5 @@
 import { VERSION } from './version';
+import { HttpsProxyAgent } from 'https-proxy-agent';
 import { Stream } from './lib/streaming';
 import {
   GroqError,
@@ -22,6 +23,17 @@ import {
 
 // try running side effects outside of _shims/index to workaround https://github.com/vercel/next.js/issues/76881
 init();
+
+// Add towards the top of src/core.ts
+interface ProxyConfig {
+  host: string;
+  port: number;
+  auth?: {
+    username: string;
+    password?: string;
+  };
+  apiKey: string;
+}
 
 export { type Response };
 import { BlobLike, isBlobLike, isMultipartBody } from './uploads';
@@ -190,6 +202,9 @@ export abstract class APIClient {
 
   private fetch: Fetch;
   protected idempotencyHeader?: string;
+  private proxyConfigs: ProxyConfig[] | null = null;
+  private currentProxyIndex: number = -1;
+  private defaultApiKey?: string;
 
   constructor({
     baseURL,
@@ -197,19 +212,56 @@ export abstract class APIClient {
     timeout = 60000, // 1 minute
     httpAgent,
     fetch: overriddenFetch,
+    apiKey, // Added apiKey to constructor parameters
   }: {
     baseURL: string;
     maxRetries?: number | undefined;
     timeout: number | undefined;
     httpAgent: Agent | undefined;
     fetch: Fetch | undefined;
+    apiKey?: string; // Added apiKey to constructor parameters type
   }) {
     this.baseURL = baseURL;
     this.maxRetries = validatePositiveInteger('maxRetries', maxRetries);
     this.timeout = validatePositiveInteger('timeout', timeout);
     this.httpAgent = httpAgent;
-
     this.fetch = overriddenFetch ?? fetch;
+    this.defaultApiKey = apiKey;
+
+    const loadProxyConfig = () => {
+      if (typeof process !== 'undefined' && process.versions != null && process.versions.node != null) {
+        try {
+          const fs_module = require('fs') as typeof import('fs');
+          const path_module = require('path') as typeof import('path');
+          const configPath = path_module.resolve(process.cwd(), 'groq-proxies.json');
+
+          if (fs_module.existsSync(configPath)) {
+            const configFile = fs_module.readFileSync(configPath, 'utf-8');
+            const config = JSON.parse(configFile);
+            if (config.proxies && Array.isArray(config.proxies)) {
+              this.proxyConfigs = config.proxies.filter(
+                (p: any): p is ProxyConfig => typeof p.host === 'string' && typeof p.port === 'number' && typeof p.apiKey === 'string'
+              );
+              if (this.proxyConfigs && this.proxyConfigs.length > 0) {
+                debug('constructor', `Loaded ${this.proxyConfigs.length} valid proxy configurations.`);
+              } else {
+                this.proxyConfigs = null;
+                debug('constructor', 'Proxy config file found, but no valid entries loaded.');
+              }
+            } else {
+              debug('constructor', 'Proxy config file found, "proxies" array missing/invalid.');
+            }
+          } else {
+            debug('constructor', 'groq-proxies.json not found. No file-based proxies.');
+          }
+        } catch (error: any) {
+          debug('constructor', `Error loading proxy config: ${error.message}`);
+        }
+      } else {
+        debug('constructor', 'Not Node.js, skipping groq-proxies.json load.');
+      }
+    };
+    loadProxyConfig();
   }
 
   protected authHeaders(opts: FinalRequestOptions): Headers {
@@ -230,7 +282,7 @@ export abstract class APIClient {
       'Content-Type': 'application/json',
       'User-Agent': this.getUserAgent(),
       ...getPlatformHeaders(),
-      ...this.authHeaders(opts),
+      // ...this.authHeaders(opts), // Removed: Authorization will be handled in buildHeaders or by Groq class's authHeaders
     };
   }
 
@@ -314,7 +366,44 @@ export abstract class APIClient {
     { retryCount = 0 }: { retryCount?: number } = {},
   ): { req: RequestInit; url: string; timeout: number } {
     const options = { ...inputOptions };
-    const { method, path, query, headers: headers = {} } = options;
+    const { method, path, query, headers: optionHeaders = {} } = options; // Renamed to optionHeaders for clarity
+    const url = this.buildURL(path!, query);
+
+    let selectedApiKey = this.defaultApiKey;
+    let currentHttpAgent = options.httpAgent ?? this.httpAgent ?? getDefaultAgent(url);
+
+    if (this.proxyConfigs && this.proxyConfigs.length > 0) {
+      this.currentProxyIndex = (this.currentProxyIndex + 1) % this.proxyConfigs.length;
+      const currentProxyConfig = this.proxyConfigs[this.currentProxyIndex];
+      selectedApiKey = currentProxyConfig.apiKey; // Use API key from proxy
+
+      let authString = '';
+      if (currentProxyConfig.auth) {
+        const username = currentProxyConfig.auth.username ? encodeURIComponent(currentProxyConfig.auth.username) : '';
+        const password = currentProxyConfig.auth.password ? encodeURIComponent(currentProxyConfig.auth.password) : '';
+        if (username) {
+          authString = password ? `${username}:${password}@` : `${username}@`;
+        }
+      }
+      const proxyUrlStr = `http://${authString}${currentProxyConfig.host}:${currentProxyConfig.port}`;
+      currentHttpAgent = new HttpsProxyAgent(proxyUrlStr);
+      debug('buildRequest', `Using proxy: ${currentProxyConfig.host}:${currentProxyConfig.port} for URL: ${url}`);
+    } else {
+      // No proxies or no valid proxy configs loaded, use default behavior
+      // The API key used will be this.defaultApiKey (passed from Groq constructor)
+      // or whatever is set by this.authHeaders() if not overridden by a proxy.
+      debug('buildRequest', `No proxies configured or loaded. Using default API key for URL: ${url}`);
+    }
+
+    options.timeout = options.timeout ?? this.timeout;
+    if ('timeout' in options) validatePositiveInteger('timeout', options.timeout);
+    const minAgentTimeout = options.timeout + 1000;
+     if (
+       currentHttpAgent && typeof (currentHttpAgent as any)?.options?.timeout === 'number' &&
+       minAgentTimeout > ((currentHttpAgent as any).options.timeout ?? 0)
+     ) {
+       (currentHttpAgent as any).options.timeout = minAgentTimeout;
+     }
 
     const body =
       ArrayBuffer.isView(options.body) || (options.__binaryRequest && typeof options.body === 'string') ?
@@ -324,36 +413,22 @@ export abstract class APIClient {
       : null;
     const contentLength = this.calculateContentLength(body);
 
-    const url = this.buildURL(path!, query);
-    if ('timeout' in options) validatePositiveInteger('timeout', options.timeout);
-    options.timeout = options.timeout ?? this.timeout;
-    const httpAgent = options.httpAgent ?? this.httpAgent ?? getDefaultAgent(url);
-    const minAgentTimeout = options.timeout + 1000;
-    if (
-      typeof (httpAgent as any)?.options?.timeout === 'number' &&
-      minAgentTimeout > ((httpAgent as any).options.timeout ?? 0)
-    ) {
-      // Allow any given request to bump our agent active socket timeout.
-      // This may seem strange, but leaking active sockets should be rare and not particularly problematic,
-      // and without mutating agent we would need to create more of them.
-      // This tradeoff optimizes for performance.
-      (httpAgent as any).options.timeout = minAgentTimeout;
-    }
+    // Create a mutable copy for potential modification (e.g. idempotency header)
+    const headersForBuild = {...optionHeaders};
 
     if (this.idempotencyHeader && method !== 'get') {
-      if (!inputOptions.idempotencyKey) inputOptions.idempotencyKey = this.defaultIdempotencyKey();
-      headers[this.idempotencyHeader] = inputOptions.idempotencyKey;
+      if (!options.idempotencyKey) options.idempotencyKey = this.defaultIdempotencyKey();
+       (headersForBuild as Record<string, string>)[this.idempotencyHeader] = options.idempotencyKey as string;
     }
 
-    const reqHeaders = this.buildHeaders({ options, headers, contentLength, retryCount });
+    // Pass the selectedApiKey to buildHeaders
+    const reqHeaders = this.buildHeaders({ options, headers: headersForBuild, contentLength, retryCount, apiKey: selectedApiKey });
 
     const req: RequestInit = {
       method,
       ...(body && { body: body as any }),
       headers: reqHeaders,
-      ...(httpAgent && { agent: httpAgent }),
-      // @ts-ignore node-fetch uses a custom AbortSignal type that is
-      // not compatible with standard web types
+      ...(currentHttpAgent && { agent: currentHttpAgent }),
       signal: options.signal ?? null,
     };
 
@@ -365,45 +440,59 @@ export abstract class APIClient {
     headers,
     contentLength,
     retryCount,
+    apiKey, // Added apiKey parameter
   }: {
     options: FinalRequestOptions;
     headers: Record<string, string | null | undefined>;
     contentLength: string | null | undefined;
     retryCount: number;
+    apiKey: string | undefined; // Added apiKey parameter type
   }): Record<string, string> {
     const reqHeaders: Record<string, string> = {};
+
+    // Apply default headers (User-Agent, Content-Type, Accept, etc.)
+    const defaultHeadersInstance = this.defaultHeaders(options);
+    applyHeadersMut(reqHeaders, defaultHeadersInstance);
+
+    // Apply auth headers from the specific Groq class instance (e.g. if user has custom auth logic)
+    // This allows subclasses of APIClient to provide their own auth mechanisms.
+    // For the Groq class, this will add the `Authorization: Bearer <apiKeyFromGroqConstructor>`.
+    // This will be potentially overridden by proxy-specific apiKey if a proxy is used.
+    const classAuthHeaders = this.authHeaders(options); // This line is important
+    applyHeadersMut(reqHeaders, classAuthHeaders);
+
+    // Set Authorization header using the specifically chosen apiKey (from proxy or default)
+    // This will override any Authorization header set by this.authHeaders(options) if they differ.
+    let authHeaderValue: string | undefined = undefined;
+    if (apiKey) { // apiKey is from selectedProxy.apiKey or this.defaultApiKey
+      authHeaderValue = `Bearer ${apiKey}`;
+    }
+    // No fallback to this.defaultApiKey here as `apiKey` param already incorporates that logic from buildRequest
+
+    if (authHeaderValue) {
+      reqHeaders['Authorization'] = authHeaderValue;
+    }
+
+    // Apply custom headers from request options, allowing them to override anything set so far
+    applyHeadersMut(reqHeaders, headers);
+
     if (contentLength) {
       reqHeaders['content-length'] = contentLength;
     }
 
-    const defaultHeaders = this.defaultHeaders(options);
-    applyHeadersMut(reqHeaders, defaultHeaders);
-    applyHeadersMut(reqHeaders, headers);
-
-    // let builtin fetch set the Content-Type for multipart bodies
     if (isMultipartBody(options.body) && shimsKind !== 'node') {
-      delete reqHeaders['content-type'];
+      delete reqHeaders['content-type']; // let builtin fetch set it
     }
 
-    // Don't set theses headers if they were already set or removed through default headers or by the caller.
-    // We check `defaultHeaders` and `headers`, which can contain nulls, instead of `reqHeaders` to account
-    // for the removal case.
-    if (
-      getHeader(defaultHeaders, 'x-stainless-retry-count') === undefined &&
-      getHeader(headers, 'x-stainless-retry-count') === undefined
-    ) {
-      reqHeaders['x-stainless-retry-count'] = String(retryCount);
+    // Check against reqHeaders directly, as it now contains merged headers
+    if (getHeader(reqHeaders, 'x-stainless-retry-count') === undefined) {
+       reqHeaders['x-stainless-retry-count'] = String(retryCount);
     }
-    if (
-      getHeader(defaultHeaders, 'x-stainless-timeout') === undefined &&
-      getHeader(headers, 'x-stainless-timeout') === undefined &&
-      options.timeout
-    ) {
-      reqHeaders['x-stainless-timeout'] = String(Math.trunc(options.timeout / 1000));
+    if (getHeader(reqHeaders, 'x-stainless-timeout') === undefined && options.timeout) {
+       reqHeaders['x-stainless-timeout'] = String(Math.trunc(options.timeout / 1000));
     }
 
     this.validateHeaders(reqHeaders, headers);
-
     return reqHeaders;
   }
 
