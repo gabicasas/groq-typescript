@@ -349,6 +349,57 @@ await client.chat.completions.create(
 );
 ```
 
+#### Automatic Proxy Rotation via Configuration File (Node.js)
+
+In a Node.js environment, the Groq SDK offers a convenient way to automatically rotate through a list of proxies for your API requests. This is managed by a configuration file named `groq-proxies.json` located in the root of your project directory.
+
+**Configuration File Format:**
+
+The `groq-proxies.json` file should contain a JSON object with a single key, `proxies`, which is an array of proxy configurations. Each proxy configuration object can have the following fields:
+
+*   `host` (string, required): The hostname or IP address of the proxy server.
+*   `port` (number, required): The port number of the proxy server.
+*   `auth` (object, optional): Authentication details for the proxy.
+    *   `username` (string): Username for proxy authentication.
+    *   `password` (string): Password for proxy authentication.
+*   `apiKey` (string, required): The specific Groq API key to be used when requests are routed through this proxy.
+
+**Example `groq-proxies.json`:**
+
+```json
+{
+  "proxies": [
+    {
+      "host": "proxy1.example.com",
+      "port": 8080,
+      "auth": {
+        "username": "user1",
+        "password": "password1"
+      },
+      "apiKey": "groq_api_key_for_proxy1"
+    },
+    {
+      "host": "proxy2.example.com",
+      "port": 8081,
+      "apiKey": "groq_api_key_for_proxy2"
+    },
+    {
+      "host": "secure.proxy3.com",
+      "port": 8888,
+      "apiKey": "groq_api_key_for_proxy3"
+    }
+  ]
+}
+```
+
+**How it Works:**
+
+On initialization, the SDK attempts to load and parse `groq-proxies.json`. If the file is found and contains valid proxy entries, the SDK will cycle through these proxies in a round-robin fashion for subsequent API requests. The `apiKey` specified for each proxy entry will be used in the `Authorization` header for requests made via that proxy.
+
+This automated proxy rotation takes precedence over the `httpAgent` option if `groq-proxies.json` is successfully loaded and used. If the file is not found, is empty, or an error occurs during loading, the SDK will fall back to using the API key provided in the `Groq` client constructor (or the `GROQ_API_KEY` environment variable) and any manually configured `httpAgent`.
+
+**Note:** This file-based proxy configuration feature currently relies on Node.js file system APIs and is therefore only effective in Node.js environments.
+
 ## Semantic versioning
 
 This package generally follows [SemVer](https://semver.org/spec/v2.0.0.html) conventions, though certain backwards-incompatible changes may be released as minor versions:
